@@ -29,27 +29,27 @@ class GaussianMixtureIOLayer(nn.Module):
         self.latent_dim = c.latent_dim
         self.num_components = c.num_components
         self.input_projection = nn.Linear(c.latent_dim, c.dim)
-        
+
         self.fc_loc = nn.Linear(c.dim, c.num_components * c.latent_dim)
         self.fc_scale = nn.Linear(c.dim, c.num_components * c.latent_dim)
         self.fc_weight = nn.Linear(c.dim, c.num_components)
-    
+
     def _square_plus(self, x):
         return (x + T.sqrt(T.square(x) + 4)) / 2
-    
+
     def input(self, sampled_latents: T.Tensor) -> T.Tensor:
         """Pre-sampled latents T.Tensor (B, L, Z) -> float tensor (B, L, D)"""
         hidden = self.input_projection(sampled_latents)
         return hidden
-    
+
     def output(self, h: T.Tensor) -> Tuple[T.Tensor, T.Tensor, T.Tensor]:
         """float tensor (B, L, D) -> Tuple of locs, scales, and weights"""
         batch_size, seq_len, _ = h.shape
-        
+
         locs = self.fc_loc(h).view(batch_size, seq_len, self.num_components, self.latent_dim)
         scales = T.clamp(self._square_plus(self.fc_scale(h)), min=1e-6).view(batch_size, seq_len, self.num_components, self.latent_dim)
         weights = self.fc_weight(h).view(batch_size, seq_len, self.num_components)
-        
+
         return (locs, scales, weights)
 
     def loss(self, data, dataHat):
@@ -63,7 +63,7 @@ class GaussianMixtureIOLayer(nn.Module):
         log_weights = F.log_softmax(weights, dim=-1)
         return -T.logsumexp(log_weights + log_probs, dim=-1)
 
-    
+
     def temp_sample(self, orig_pdist, temp):
         locs, scales, weights = orig_pdist
         if temp is None:
@@ -136,7 +136,7 @@ class FSQ(nn.Module):
     @property
     def needs_float32_params(self):
         return True
-    
+
     class Config:
         levels: List[int]
         dim: int | None = None
@@ -149,7 +149,7 @@ class FSQ(nn.Module):
         return_indices: bool = True
         force_quantization_f32: bool = True
         use_rms: bool = False
-        
+
     def __init__(self, c: Config):
         super().__init__()
         _levels = T.tensor(c.levels, dtype=int32)
@@ -172,7 +172,7 @@ class FSQ(nn.Module):
                 self.allowed_dtypes.append(getattr(T, dtype_str))
             else:
                 raise ValueError(f"Invalid dtype string: {dtype_str}")
-            
+
         self.effective_codebook_dim = effective_codebook_dim
 
         keep_num_codebooks_dim = default(c.keep_num_codebooks_dim, c.num_codebooks > 1)
@@ -218,11 +218,11 @@ class FSQ(nn.Module):
         quantized = round_ste(self.bound(z))
         half_width = self._levels // 2 # Renormalize to [-1, 1].
         return quantized / half_width
-    
+
     def _scale_and_shift(self, zhat_normalized):
         half_width = self._levels // 2
         return (zhat_normalized * half_width) + half_width
-    
+
     def _scale_and_shift_inverse(self, zhat):
         half_width = self._levels // 2
         return (zhat - half_width) / half_width
@@ -284,7 +284,6 @@ class FSQ(nn.Module):
         assert z.shape[-1] == self.dim, f'expected dimension of {self.dim} but found dimension of {z.shape[-1]}'
 
         z = self.project_in(z)
-
         z = rearrange(z, 'b n (c d) -> b n c d', c = self.num_codebooks)
 
         # whether to force quantization step to be full precision or not

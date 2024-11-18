@@ -11,7 +11,7 @@ from tokenizer import make_tokenizer
 
 
 from utils import si_module, exists, isnt, tqdm0, print0, default, print0_colored
-from utils import load_ckpt    
+from utils import load_ckpt
 
 
 @si_module
@@ -28,6 +28,7 @@ class LatentQuantizer(nn.Module):
     def __init__(self, c: Config):
         super().__init__()
 
+        ic(c)
         if exists(c.from_pretrained):
             checkpoint = load_ckpt(*c.from_pretrained)
         else:
@@ -41,17 +42,17 @@ class LatentQuantizer(nn.Module):
             self.load_state_dict(checkpoint)
 
     @T.no_grad()
-    def forward(self, x, return_latent=False, known_latent=None):  
+    def forward(self, x, return_latent=False, known_latent=None):
         """
         x: (B, S, D)
         """
-        if exists(known_latent): 
+        if exists(known_latent):
             return self.compressor.indices_to_codes(known_latent)
 
         x = self.input(x)
         x = self.ffnn(x)
         x, tokens = self.compressor(x)
-        
+
         if return_latent:
             return x, tokens
         return x
@@ -103,7 +104,7 @@ class TransformerVAE(nn.Module):
         cache_shape = [self.cache_num_layers, c.stack_config.seq_len, 2, kv_heads, head_dim]
         self.cache_shape = cache_shape
         self.cache = [None] * self.cache_num_layers
-        
+
         if exists(c.from_pretrained):
             result = self.load_state_dict(checkpoint, strict=False)
             print0_colored(result, 'yellow')
@@ -122,7 +123,7 @@ class TransformerVAE(nn.Module):
         else:
             with T.autocast(device_type='cuda', dtype=T.bfloat16):
                 return self.quantizer(x)
-    
+
     @T.no_grad()
     def untokenize(self, token_data):
         return self.quantizer(None, known_latent=token_data)
@@ -134,7 +135,7 @@ class TransformerVAE(nn.Module):
 
     def deinit_cache(self):
         self.cache = [None] * self.cache_num_layers
-    
+
     @T.no_grad()
     def forward(self, data, next_tokens: Optional[Tuple[T.Tensor, T.Tensor]] = None, temps: Optional[Tuple[float, Tuple[float, float]]] = None):
         if self.c.split:
@@ -280,7 +281,7 @@ class HertzDevModel(nn.Module):
             self.audio_latent_cache = token_data[:, -(6*8):]
         elif self.use_audio_cache:
             self.audio_latent_cache = token_data[:, -(6*8):]
-        
+
         if token_data.shape[-1] == 2*self.c.latent_size:
             dec_ch1 = self.audio_tokenizer.data_from_latent(token_data[:, :self.c.latent_size])
             dec_ch2 = self.audio_tokenizer.data_from_latent(token_data[:, self.c.latent_size:])
@@ -300,10 +301,10 @@ class HertzDevModel(nn.Module):
         self.audio_cache = None
         self.audio_latent_cache = None
         self.use_audio_cache = False
-    
+
     @T.no_grad()
     def forward(self, data):
-        if self.c.split:    
+        if self.c.split:
             x1, x2 = data.chunk(2, dim=-1)
             x = self.input(x1) + self.input2(x2)
         else:
@@ -316,7 +317,7 @@ class HertzDevModel(nn.Module):
             return self.output(x), self.output2(x)
         else:
             return self.output(x)
-        
+
     @T.no_grad()
     def next_audio_from_audio(self, audio_data: T.Tensor, temps=(0.8, (0.5, 0.1))):
         latents_in = self.tokenize(audio_data)
@@ -325,7 +326,7 @@ class HertzDevModel(nn.Module):
         audio_decoded = self.untokenize(next_model_latent)[..., -2000:]
         return audio_decoded
 
-        
+
     @T.no_grad()
     def next_latent(self, model_input: T.Tensor, temps=(0.8, (0.5, 0.1))):
 
@@ -358,18 +359,18 @@ class HertzDevModel(nn.Module):
         next_input = generated = data
 
         target_len = min(data.shape[1] + default(gen_len, data.shape[1]), self.c.stack_config.seq_len)
-        
+
         for _ in tqdm0(range(data.shape[1], target_len)):
             model_input = next_input if use_cache else generated
 
             next_input = self.next_latent(model_input, temps)
-    
+
             generated = T.cat([generated, next_input], dim=1)
 
         if use_cache:
             self.deinit_cache()
         return generated
-    
+
 
 
 def get_hertz_dev_config(is_split=True, use_pure_audio_ablation=False):

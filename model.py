@@ -28,7 +28,6 @@ class LatentQuantizer(nn.Module):
     def __init__(self, c: Config):
         super().__init__()
 
-        ic(c)
         if exists(c.from_pretrained):
             checkpoint = load_ckpt(*c.from_pretrained)
         else:

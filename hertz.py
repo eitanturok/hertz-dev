@@ -12,7 +12,7 @@ from torch.amp import autocast
 
 from einops import rearrange, pack, unpack
 
-from utils import si_module, exists, default, maybe
+from utils import default, maybe
 
 from tinygrad import Tensor, nn, dtypes
 from tinygrad.dtype import DTYPES_DICT
@@ -247,7 +247,7 @@ class FSQ:
 
     def indices_to_codes(self, indices):
         """ Inverse of `codes_to_indices`. """
-        assert exists(indices)
+        assert indices is not None
 
         is_img_or_video = indices.ndim >= (3 + int(self.keep_num_codebooks_dim))
 
@@ -326,39 +326,23 @@ class FFNN:
 
 class LatentQuantizer:
 
-    def __init__(self, dim: int, compressor_config: Optional[FSQ.Config] = None, ff_dim: Optional[int] = None, input_dim: int = None, from_pretrained: Optional[Tuple[str, str]] = None):
+    def __init__(self, dim: int, ff_dim: int, input_dim: int, compressor: FSQ, from_pretrained: Optional[Tuple[str, str]] = None):
 
-        if exists(from_pretrained):
-            checkpoint = load_ckpt(*from_pretrained)
-        else:
-            assert exists(compressor_config), f'hmm {compressor_config}'
-
-        self.compressor = compressor_config
+        self.compressor = compressor
+        self.input = nn.Linear(input_dim, dim) if input_dim is not None else nn.Identity()
         self.ffnn = FFNN(dim, ff_dim)
-        self.input = nn.Linear(input_dim, dim) if exists(input_dim) else nn.Identity()
 
-        if exists(from_pretrained):
+        if from_pretrained is not None:
+            checkpoint = load_ckpt(*from_pretrained)
             self.load_state_dict(checkpoint)
 
-    def forward(self, x, return_latent=False, known_latent=None):
-        """
-        x: (B, S, D)
-        """
+    def __call__(self, x, return_latent=False, known_latent=None):
         Tensor.no_grad = True
-        if exists(known_latent):
+        if known_latent is not None:
             return self.compressor.indices_to_codes(known_latent)
-
-        x = self.input(x)
-        x = self.ffnn(x)
-        x, tokens = self.compressor(x)
-
+        x, tokens = self.compressor(self.ffnn(self.input(x))) # initially, x: (B, S, D)
         Tensor.no_grad = False
-
-        if return_latent:
-            return x, tokens
-        return x
-
-
+        return x, tokens if return_latent else x
 
 
 if __name__ == '__main__':
@@ -368,14 +352,13 @@ if __name__ == '__main__':
         y.bias = torch.nn.Parameter(torch.Tensor(x.bias.numpy()))
         return y
 
-    # init x
-    config = configs['test']
-    x = np.zeros((1, config['compressor']['dim'], 1, 1), dtype='float32') # METAL does not support numpy default of float64
-    x_torch = torch.Tensor(x)
-    x_tiny = Tensor(x)
-    np.testing.assert_equal(x_tiny.numpy(), x_torch.numpy())
+    def compare_fsq(config: Dict):
 
-    def compare_fsq(x_torch: torch.Tensor, x_tiny: Tensor):
+        # init x
+        x = np.zeros((1, config['compressor']['dim'], 1, 1), dtype='float32') # METAL does not support numpy default of float64
+        x_torch = torch.Tensor(x)
+        x_tiny = Tensor(x)
+        np.testing.assert_equal(x_tiny.numpy(), x_torch.numpy())
 
         # init models
         fsq_torch = torch_FSQ(torch_FSQ.Config(**config['compressor']))
@@ -395,7 +378,18 @@ if __name__ == '__main__':
         np.testing.assert_allclose(y_torch.detach().numpy(), y_tiny.numpy(), rtol=1e-6)
         np.testing.assert_allclose(idx_torch.detach().numpy(), idx_tiny.numpy(), rtol=1e-6)
 
+    config = configs['test']
+    # compare_fsq(configs['test'])
+
+    # init x; METAL does not support numpy default of float64 so use float32
+    x = np.zeros((1, 1, config['latent_quantizer']['input_dim']), dtype='float32') # (B,N,D)
+    x_torch = torch.Tensor(x)
+    x_tiny = Tensor(x)
+    np.testing.assert_equal(x_tiny.numpy(), x_torch.numpy())
+
 
     lq_config = torch_LatentQuantizer.Config(**config['latent_quantizer'] | {'compressor_config': torch_FSQ.Config(**config['compressor'])})
     lq_torch = torch_LatentQuantizer(lq_config)
-    lq_tiny = LatentQuantizer({'compressor_config': config['compressor']}, **config['latent_quantizer'])
+
+    lq_tiny = LatentQuantizer(**config['latent_quantizer'] | {'compressor':  FSQ(**config['compressor'])})
+    lq_tiny(x_tiny)

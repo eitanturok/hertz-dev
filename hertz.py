@@ -326,23 +326,13 @@ class LatentQuantizer:
         self.input = nn.Linear(input_dim, dim) if input_dim is not None else nn.Identity()
         self.ffnn = FFNN(dim, ff_dim)
 
-        if from_pretrained is not None:
-            checkpoint = load_ckpt(*from_pretrained)
-            self.load_state_dict(checkpoint)
+        if from_pretrained is not None: self.load_state_dict(load_ckpt(*from_pretrained))
 
+    @Tensor.test() # with torch.no_grad()
     def __call__(self, x: Tensor, return_latent=False, known_latent=None):
-        Tensor.no_grad = True
         if known_latent is not None:
             return self.compressor.indices_to_codes(known_latent)
-
-        # initially, x: (B, S, D)
-        x = self.input(x)
-        x = self.ffnn(x)
-        ic(x.numpy())
-        x, tokens = self.compressor(x)
-        ic(x.numpy(), tokens.numpy())
-        Tensor.no_grad = False
-
+        x, tokens = self.compressor(self.ffnn(self.input(x))) # initially, x.shape=(B, S, D)
         return (x, tokens) if return_latent else x
 
 

@@ -20,6 +20,7 @@ import numpy as np # needed for np.cumprod()
 
 from ioblocks import FSQ as torch_FSQ
 from model import LatentQuantizer as torch_LatentQuantizer
+from model import GaussianMixtureIOLayer as torch_GaussianMixtureIOLayer
 
 from icecream import install, ic
 install()
@@ -31,7 +32,9 @@ assert not (USE_PURE_AUDIO_ABLATION and TWO_SPEAKER) # We only have a single-spe
 configs = {
     'test': { # NOTE: 'float64' unavailable on METAL so removed from `allowed_dtypes`
         'compressor': dict(levels=[8,8,8,8,8], dim=4, num_codebooks=1, keep_num_codebooks_dim=None, scale=None, allowed_dtypes=['float32', 'bfloat16'], channel_first=False, projection_has_bias=True, return_indices=True, force_quantization_f32=True, use_rms=False),
-        'latent_quantizer': dict(dim=2048, ff_dim=8192, input_dim=32),
+        'latent_quantizer': dict(dim=4, ff_dim=8192, input_dim=32),
+        'gaussian_mixture': {},
+
     },
     'base': {
         'compressor': dict(levels=[8,8,8,8,8], dim=2048, num_codebooks=1, keep_num_codebooks_dim=None, scale=None, allowed_dtypes=['float32', 'float64', 'bfloat16'], channel_first=False, projection_has_bias=True, return_indices=True, force_quantization_f32=True, use_rms=False),
@@ -263,34 +266,17 @@ class FSQ:
 
         return codes
 
-    def reshape_z(self, z: Tensor) -> Tuple[Tensor, Tensor]:
+    def __call__(self, z: Tensor, return_codes=False):
+        # b=batch, n=seq_len, d=dim, c=codebook_dim
+
+        # reshape z
         is_img_or_video = z.ndim >= 4
         need_move_channel_last = is_img_or_video or self.channel_first
-
-        # standardize image or video into (batch, seq, dimension)
         if need_move_channel_last:
             z = rearrange(z, 'b d ... -> b ... d')
             z, ps = pack_one(z, 'b * d')
         assert z.shape[-1] == self.dim, f'expected dimension of {self.dim} but found dimension of {z.shape[-1]}'
-        return z, ps
 
-    def reshape_outputs(self, z: Tensor, ps: Tensor, out: Tensor, indices: Tensor):
-        is_img_or_video = z.ndim >= 4
-        need_move_channel_last = is_img_or_video or self.channel_first
-
-        if need_move_channel_last:
-            out = unpack_one(out, ps, 'b * d')
-            out = rearrange(out, 'b ... d -> b d ...')
-            indices = maybe(unpack_one)(indices, ps, 'b * c')
-
-        if not self.keep_num_codebooks_dim and self.return_indices:
-            indices = maybe(rearrange)(indices, '... 1 -> ...')
-
-        return out, indices
-
-    def __call__(self, z: Tensor, return_codes=False):
-        # b=batch, n=seq_len, d=dim, c=codebook_dim
-        z, ps = self.reshape_z(z)
         z = self.project_in(z)
         z = rearrange(z, 'b n (c d) -> b n c d', c=self.num_codebooks)
 
@@ -309,24 +295,32 @@ class FSQ:
         if return_codes:
             return codes, indices
         out = self.project_out(codes)
-        out, indices = self.reshape_outputs(z, ps, out, indices)
+
+        # reshape outputs
+        if need_move_channel_last:
+            out = unpack_one(out, ps, 'b * d')
+            out = rearrange(out, 'b ... d -> b d ...')
+            indices = maybe(unpack_one)(indices, ps, 'b * c')
+        if not self.keep_num_codebooks_dim and self.return_indices:
+            indices = maybe(rearrange)(indices, '... 1 -> ...')
+
         return out, indices
 
 
 class FFNN:
     def __init__(self, dim: int, expand_dim: Optional[int] = None):
         expand_dim = expand_dim if expand_dim is not None else 256 * ((int(2 * 4 * dim / 3) + 256 - 1) // 256)
-        self.up_proj = nn.Linear(dim, 2*expand_dim)
+        self.gateup_proj = nn.Linear(dim, 2*expand_dim)
         self.down_proj = nn.Linear(expand_dim, dim)
 
-    def __call__(self, x: Tensor):
-        gate, up = self.up_proj(x).chunk(2, dim=-1)
+    def __call__(self, x: Tensor) -> Tensor:
+        gate, up = self.gateup_proj(x).chunk(2, dim=-1)
         return self.down_proj(up * gate.silu())
 
 
 class LatentQuantizer:
 
-    def __init__(self, dim: int, ff_dim: int, input_dim: int, compressor: FSQ, from_pretrained: Optional[Tuple[str, str]] = None):
+    def __init__(self, dim: int, ff_dim: int, input_dim: Optional[int], compressor: FSQ, from_pretrained: Optional[Tuple[str, str]] = None):
 
         self.compressor = compressor
         self.input = nn.Linear(input_dim, dim) if input_dim is not None else nn.Identity()
@@ -336,60 +330,99 @@ class LatentQuantizer:
             checkpoint = load_ckpt(*from_pretrained)
             self.load_state_dict(checkpoint)
 
-    def __call__(self, x, return_latent=False, known_latent=None):
+    def __call__(self, x: Tensor, return_latent=False, known_latent=None):
         Tensor.no_grad = True
         if known_latent is not None:
             return self.compressor.indices_to_codes(known_latent)
-        x, tokens = self.compressor(self.ffnn(self.input(x))) # initially, x: (B, S, D)
+
+        # initially, x: (B, S, D)
+        x = self.input(x)
+        x = self.ffnn(x)
+        ic(x.numpy())
+        x, tokens = self.compressor(x)
+        ic(x.numpy(), tokens.numpy())
         Tensor.no_grad = False
-        return x, tokens if return_latent else x
+
+        return (x, tokens) if return_latent else x
 
 
-if __name__ == '__main__':
 
-    def override_linear(x: Tensor, y: torch.Tensor):
-        y.weight = torch.nn.Parameter(torch.Tensor(x.weight.numpy()))
-        y.bias = torch.nn.Parameter(torch.Tensor(x.bias.numpy()))
-        return y
 
-    def compare_fsq(config: Dict):
 
-        # init x
-        x = np.zeros((1, config['compressor']['dim'], 1, 1), dtype='float32') # METAL does not support numpy default of float64
-        x_torch = torch.Tensor(x)
-        x_tiny = Tensor(x)
-        np.testing.assert_equal(x_tiny.numpy(), x_torch.numpy())
+# **** testing ****
 
-        # init models
-        fsq_torch = torch_FSQ(torch_FSQ.Config(**config['compressor']))
-        fsq_tiny = FSQ(**config['compressor'])
+def override_linear(y: torch.nn.Linear, x: nn.Linear) -> torch.nn.Linear:
+    y.weight = torch.nn.Parameter(torch.Tensor(x.weight.detach().numpy()))
+    y.bias = torch.nn.Parameter(torch.Tensor(x.bias.detach().numpy()))
+    return y
 
-        # init fsq_torch with weights from fsq_tiny
-        fsq_torch.project_in = override_linear(fsq_tiny.project_in, fsq_torch.project_in)
-        fsq_torch.project_out = override_linear(fsq_tiny.project_out, fsq_torch.project_out)
+def compare_fsq(config: Dict):
 
-        # test
-        np.testing.assert_equal(fsq_torch.project_in.weight.detach().numpy(), fsq_tiny.project_in.weight.numpy())
-        np.testing.assert_equal(fsq_torch.project_out.weight.detach().numpy(), fsq_tiny.project_out.weight.numpy())
-
-        # forward pass
-        y_torch, idx_torch = fsq_torch.forward(x_torch)
-        y_tiny, idx_tiny = fsq_tiny(x_tiny)
-        np.testing.assert_allclose(y_torch.detach().numpy(), y_tiny.numpy(), rtol=1e-6)
-        np.testing.assert_allclose(idx_torch.detach().numpy(), idx_tiny.numpy(), rtol=1e-6)
-
-    config = configs['test']
-    # compare_fsq(configs['test'])
-
-    # init x; METAL does not support numpy default of float64 so use float32
-    x = np.zeros((1, 1, config['latent_quantizer']['input_dim']), dtype='float32') # (B,N,D)
+    # init x of shape (b,d,n,c)
+    x = np.zeros((1, config['compressor']['dim'], 1, 1), dtype='float32') # METAL does not support numpy default of float64
     x_torch = torch.Tensor(x)
     x_tiny = Tensor(x)
     np.testing.assert_equal(x_tiny.numpy(), x_torch.numpy())
 
+    # init fsq
+    fsq_torch = torch_FSQ(torch_FSQ.Config(**config['compressor']))
+    fsq_tiny = FSQ(**config['compressor'])
 
-    lq_config = torch_LatentQuantizer.Config(**config['latent_quantizer'] | {'compressor_config': torch_FSQ.Config(**config['compressor'])})
-    lq_torch = torch_LatentQuantizer(lq_config)
+    # init fsq_torch with weights from fsq_tiny
+    fsq_torch.project_in = override_linear(fsq_torch.project_in, fsq_tiny.project_in)
+    fsq_torch.project_out = override_linear(fsq_torch.project_out, fsq_tiny.project_out)
+    np.testing.assert_equal(fsq_torch.project_in.weight.detach().numpy(), fsq_tiny.project_in.weight.numpy())
+    np.testing.assert_equal(fsq_torch.project_out.weight.detach().numpy(), fsq_tiny.project_out.weight.numpy())
 
-    lq_tiny = LatentQuantizer(**config['latent_quantizer'] | {'compressor':  FSQ(**config['compressor'])})
-    lq_tiny(x_tiny)
+    # forward pass
+    y_torch, idx_torch = fsq_torch.forward(x_torch)
+    y_tiny, idx_tiny = fsq_tiny(x_tiny)
+    np.testing.assert_allclose(y_torch.detach().numpy(), y_tiny.numpy(), rtol=1e-6)
+    np.testing.assert_allclose(idx_torch.detach().numpy(), idx_tiny.numpy(), rtol=1e-6)
+
+def compare_lq(config):
+    # init x (B,N,D)
+    # METAL does not support numpy default of float64 so use float32
+    x = np.zeros((1, 1, config['latent_quantizer']['input_dim']), dtype='float32')
+    x_torch = torch.Tensor(x)
+    x_tiny = Tensor(x)
+    np.testing.assert_equal(x_tiny.numpy(), x_torch.numpy())
+
+    # init latent quantizer
+    lq_config_torch = torch_LatentQuantizer.Config(**config['latent_quantizer'] | {'compressor_config': torch_FSQ.Config(**config['compressor'])})
+    lq_torch = torch_LatentQuantizer(lq_config_torch)
+    lq_config_tiny = config['latent_quantizer'] | {'compressor':  FSQ(**config['compressor'])}
+    lq_tiny = LatentQuantizer(**lq_config_tiny)
+
+    # init lq_torch with weights from lq_tiny
+    lq_torch.input = override_linear(lq_torch.input, lq_tiny.input)
+    np.testing.assert_equal(lq_torch.input.weight.detach().numpy(), lq_tiny.input.weight.numpy())
+    np.testing.assert_equal(lq_torch.input.bias.detach().numpy(), lq_tiny.input.bias.numpy())
+
+    lq_torch.ffnn.gateup_proj = override_linear(lq_torch.ffnn.gateup_proj, lq_tiny.ffnn.gateup_proj)
+    np.testing.assert_equal(lq_torch.ffnn.gateup_proj.weight.detach().numpy(), lq_tiny.ffnn.gateup_proj.weight.numpy())
+    np.testing.assert_equal(lq_torch.ffnn.gateup_proj.bias.detach().numpy(), lq_tiny.ffnn.gateup_proj.bias.numpy())
+
+    lq_torch.ffnn.down_proj = override_linear(lq_torch.ffnn.down_proj, lq_tiny.ffnn.down_proj)
+    np.testing.assert_equal(lq_torch.ffnn.down_proj.weight.detach().numpy(), lq_tiny.ffnn.down_proj.weight.numpy())
+    np.testing.assert_equal(lq_torch.ffnn.down_proj.bias.detach().numpy(), lq_tiny.ffnn.down_proj.bias.numpy())
+
+    lq_torch.compressor.project_in = override_linear(lq_torch.compressor.project_in, lq_tiny.compressor.project_in)
+    np.testing.assert_equal(lq_torch.compressor.project_in.weight.detach().numpy(), lq_tiny.compressor.project_in.weight.numpy())
+    np.testing.assert_equal(lq_torch.compressor.project_in.bias.detach().numpy(), lq_tiny.compressor.project_in.bias.numpy())
+
+    lq_torch.compressor.project_out = override_linear(lq_torch.compressor.project_out, lq_tiny.compressor.project_out)
+    np.testing.assert_equal(lq_torch.compressor.project_out.weight.detach().numpy(), lq_tiny.compressor.project_out.weight.numpy())
+    np.testing.assert_equal(lq_torch.compressor.project_out.bias.detach().numpy(), lq_tiny.compressor.project_out.bias.numpy())
+
+    # forward pass
+    y_torch = lq_torch(x_torch)
+    y_tiny = lq_tiny(x_tiny)
+    np.testing.assert_allclose(y_torch.detach().numpy(), y_tiny.numpy(), rtol=1e-6)
+
+
+if __name__ == '__main__':
+
+    config = configs['test']
+    compare_fsq(configs['test'])
+    compare_lq(configs['test'])
